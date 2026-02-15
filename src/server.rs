@@ -8,17 +8,13 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tracing::{error, info, debug};
 
 use crate::{cache::Cache, thumbnail::ThumbnailGenerator};
 
-const MAX_CONCURRENT_RENDER: usize = 4;
-
 pub struct AppState {
     generator: ThumbnailGenerator,
     cache: Cache,
-    semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +89,6 @@ pub async fn create_app() -> anyhow::Result<Router> {
     let state = Arc::new(AppState {
         generator,
         cache,
-        semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDER)),
     });
 
     let app = Router::new()
@@ -160,15 +155,10 @@ async fn generate_thumbnail(
         return Ok((StatusCode::OK, Json(response)));
     }
 
-    let _permit = state.semaphore.acquire().await.map_err(|e| {
-        error!("Semaphore error: {}", e);
-        AppError::Internal("Concurrency limit error".to_string())
-    })?;
-
     info!("Cache miss - generating thumbnail for {}", params.url);
 
     let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(45),
         state.generator.generate(&params.url, params.width, params.height)
     ).await {
         Ok(Ok(result)) => result,
