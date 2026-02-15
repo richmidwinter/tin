@@ -1,11 +1,12 @@
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{info, warn, error, debug};
 
 pub struct ThumbnailResult {
     pub image_data: Vec<u8>,
@@ -35,21 +36,28 @@ impl ThumbnailGenerator {
             .arg("--disable-backgrounding-occluded-windows")
             .arg("--disable-features=TranslateUI")
             .arg("--disable-component-extensions-with-background-pages")
-            .window_size(1280, 800)
+            .window_size(1920, 1080)
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build browser config: {}", e))?;
 
         let (browser, mut handler) = Browser::launch(config).await?;
         
+        // Spawn handler loop that NEVER stops - this is critical
         tokio::spawn(async move {
             loop {
                 match handler.next().await {
-                    Some(Ok(_)) => continue,
+                    Some(Ok(_)) => {
+                        // Continue looping - don't break on success
+                    }
                     Some(Err(e)) => {
-                        warn!("Browser handler error: {}", e);
+                        warn!("Browser handler error (recovering): {}", e);
+                        // Continue looping - don't break on error
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                    None => {
+                        error!("Browser handler stream ended - browser connection lost");
                         break;
                     }
-                    None => break,
                 }
             }
         });
@@ -59,20 +67,63 @@ impl ThumbnailGenerator {
         })
     }
 
-    pub async fn generate(&self, url: &str, _width: u32, _height: u32) -> anyhow::Result<ThumbnailResult> {
-        let browser = self.browser.lock().await;
+    pub async fn generate(&self, url: &str, width: u32, height: u32) -> anyhow::Result<ThumbnailResult> {
+        info!("Starting thumbnail generation for: {} ({}x{})", url, width, height);
         
-        let page = browser.new_page(url).await?;
+        // Try to get browser lock with timeout
+        let browser = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.browser.lock()
+        ).await {
+            Ok(guard) => guard,
+            Err(_) => return Err(anyhow::anyhow!("Timeout acquiring browser lock")),
+        };
         
+        info!("Creating new page for: {}", url);
+        let page = match browser.new_page(url).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to create page for {}: {}", url, e);
+                return Err(anyhow::anyhow!("Failed to create page: {}", e));
+            }
+        };
+        
+        info!("Setting viewport to {}x{}", width, height);
+        let device_metrics = SetDeviceMetricsOverrideParams {
+            width: width as i64,
+            height: height as i64,
+            device_scale_factor: 1.0,
+            mobile: false,
+            scale: None,
+            screen_width: Some(width as i64),
+            screen_height: Some(height as i64),
+            position_x: None,
+            position_y: None,
+            dont_set_visible_size: None,
+            display_feature: None,
+            screen_orientation: None,
+            viewport: None,
+        };
+        
+        if let Err(e) = page.execute(device_metrics).await {
+            error!("Failed to set viewport for {}: {}", url, e);
+            let _ = page.close().await;
+            return Err(e.into());
+        }
+        
+        info!("Waiting for page load...");
         tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
 
         let title = page.get_title().await.ok().flatten();
+        info!("Page title: {:?}", title);
 
         let description = page.evaluate(r#"
             document.querySelector('meta[name="description"]')?.content || 
             document.querySelector('meta[property="og:description"]')?.content
         "#).await.ok().and_then(|r| r.value().and_then(|v| v.as_str().map(|s| s.to_string())))
          .filter(|s| !s.is_empty() && s != "null");
+
+        info!("Page description: {:?}", description);
 
         let _ = page.evaluate(r#"
             document.body.style.overflow = 'hidden';
@@ -84,13 +135,28 @@ impl ThumbnailGenerator {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let screenshot = page.screenshot(
+        info!("Taking screenshot...");
+        let screenshot = match page.screenshot(
             ScreenshotParams::builder()
                 .format(CaptureScreenshotFormat::Png)
                 .full_page(false)
                 .build()
-        ).await?;
+        ).await {
+            Ok(data) => {
+                info!("Screenshot captured: {} bytes", data.len());
+                if data.is_empty() {
+                    return Err(anyhow::anyhow!("Screenshot data is empty"));
+                }
+                data
+            }
+            Err(e) => {
+                error!("Screenshot failed for {}: {}", url, e);
+                let _ = page.close().await;
+                return Err(e.into());
+            }
+        };
 
+        info!("Closing page...");
         let _ = page.close().await;
 
         Ok(ThumbnailResult {
@@ -101,7 +167,13 @@ impl ThumbnailGenerator {
     }
 
     pub async fn is_healthy(&self) -> bool {
-        let browser = self.browser.lock().await;
+        let browser = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.browser.lock()
+        ).await {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
         browser.new_page("about:blank").await.is_ok()
     }
 }
